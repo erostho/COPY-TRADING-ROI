@@ -1,189 +1,238 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import os
-import sys
+import json
 import time
-import math
 import logging
-from datetime import datetime, date, timedelta
-from dateutil.relativedelta import relativedelta
+from datetime import datetime, timedelta, timezone
 import requests
 
-# ---------- Config ----------
-API_BASE = "https://www.myfxbook.com/api"
-EMAIL = os.getenv("MYFXBOOK_EMAIL")
-PASSWORD = os.getenv("MYFXBOOK_PASSWORD")
-PREFERRED_ACCOUNT_ID = os.getenv("MYFXBOOK_ACCOUNT_ID")  # optional
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-TZ = os.getenv("TZ", "Asia/Ho_Chi_Minh")
-
+# ============== Logging ==============
 logging.basicConfig(
-    level=logging.INFO,
+    level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
-# ---------- Helpers ----------
-def dt_today():
-    # Myfxbook API expects YYYY-MM-DD in account timezone; we use local date
-    return date.today()
+# ============== ENV ==============
+EMAIL = os.getenv("MYFXBOOK_EMAIL", "")
+PASSWORD = os.getenv("MYFXBOOK_PASSWORD", "")
+PREF_ACC_ID = os.getenv("MYFXBOOK_ACCOUNT_ID", "")
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+TITLE_PREFIX = "💵 TRADE GOODS"
 
-def ymd(d: date) -> str:
-    return d.strftime("%Y-%m-%d")
+# ============== CONST ==============
+API_BASE = "https://www.myfxbook.com/api"
+HTTP_HEADERS = {"User-Agent": "roi-bot/1.0"}
+HTTP_TIMEOUT = 30
 
-def compound_gain_percent(daily_list):
-    """
-    daily_list: [{'date':'YYYY-MM-DD','value': <percent>}, ...]
-    Return compounded % gain over the list.
-    """
-    total = 1.0
-    for item in daily_list:
-        try:
-            r = float(item.get("value", 0.0))
-        except Exception:
-            r = 0.0
-        total *= (1.0 + r / 100.0)
-    return (total - 1.0) * 100.0
 
-def api_login():
+# ============== Utils ==============
+def now_vn():
+    """Trả về datetime theo múi giờ từ ENV (mặc định +7)."""
+    tzname = os.getenv("TZ", "Asia/Ho_Chi_Minh")
+    try:
+        if tzname == "Asia/Ho_Chi_Minh":
+            return datetime.now(timezone(timedelta(hours=7)))
+        # fallback: giờ local của container
+        return datetime.now()
+    except Exception:
+        return datetime.utcnow()
+
+
+def http_get(url: str, params: dict | None = None) -> dict:
+    """GET JSON, raise nếu không 2xx."""
+    r = requests.get(url, params=params, headers=HTTP_HEADERS, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    try:
+        return r.json()
+    except Exception:
+        logging.debug("Raw response: %s", r.text[:500])
+        raise
+
+
+def myfx_login() -> str:
     if not EMAIL or not PASSWORD:
-        raise RuntimeError("Missing MYFXBOOK_EMAIL or MYFXBOOK_PASSWORD")
+        raise RuntimeError("Thiếu MYFXBOOK_EMAIL / MYFXBOOK_PASSWORD")
     url = f"{API_BASE}/login.json"
-    r = requests.get(url, params={"email": EMAIL, "password": PASSWORD}, timeout=20)
-    r.raise_for_status()
-    data = r.json()
-    if not data.get("error"):
-        session = data.get("session")
-        if not session:
-            raise RuntimeError("Login ok but no session returned")
-        return session
-    raise RuntimeError(f"Login error: {data.get('message')}")
+    params = {"email": EMAIL, "password": PASSWORD}
+    logging.info("Myfxbook: login...")
+    j = http_get(url, params)
+    if j.get("error") is False and "session" in j:
+        logging.info("Myfxbook: login OK")
+        return j["session"]
+    raise RuntimeError(f"Login failed: {j}")
 
-def api_call(path, params):
-    url = f"{API_BASE}/{path}"
-    r = requests.get(url, params=params, timeout=30)
-    r.raise_for_status()
-    data = r.json()
-    if data.get("error"):
-        raise RuntimeError(data.get("message"))
-    return data
 
-def pick_account_id(session):
-    # If user specified, validate it exists; else pick the first account
-    data = api_call("get-my-accounts.json", {"session": session})
-    accounts = data.get("accounts", [])
+def myfx_logout(session: str) -> None:
+    try:
+        http_get(f"{API_BASE}/logout.json", {"session": session})
+    except Exception:
+        pass
+
+
+def myfx_get_accounts(session: str) -> list:
+    j = http_get(f"{API_BASE}/get-my-accounts.json", {"session": session})
+    if j.get("error") is False and isinstance(j.get("accounts"), list):
+        return j["accounts"]
+    raise RuntimeError(f"get-my-accounts failed: {j}")
+
+
+def pick_account(accounts: list) -> tuple[str, dict]:
+    """Chọn account theo MYFXBOOK_ACCOUNT_ID; mặc định lấy cái đầu tiên."""
+    if PREF_ACC_ID:
+        for a in accounts:
+            if str(a.get("id")) == str(PREF_ACC_ID):
+                return str(a.get("id")), a
+        logging.warning("MYFXBOOK_ACCOUNT_ID không khớp – dùng account đầu tiên.")
     if not accounts:
-        raise RuntimeError("No accounts found in Myfxbook.")
-    if PREFERRED_ACCOUNT_ID:
-        for acc in accounts:
-            if str(acc.get("id")) == str(PREFERRED_ACCOUNT_ID):
-                return acc.get("id"), acc
-        raise RuntimeError(f"Account id {PREFERRED_ACCOUNT_ID} not found in Myfxbook.")
-    # Default: choose the one with latest update time
-    accounts_sorted = sorted(
-        accounts,
-        key=lambda a: a.get("lastUpdateDate", ""),
-        reverse=True,
+        raise RuntimeError("Không có account nào trong Myfxbook.")
+    a = accounts[0]
+    return str(a.get("id")), a
+def myfx_daily_gain(session: str, acc_id: str, start: str, end: str) -> list:
+    """
+    Lấy daily gain % theo ngày.
+    Trả list các dict có 'date' và 'value' (hoặc 'gain' tuỳ API version).
+    """
+    j = http_get(
+        f"{API_BASE}/get-daily-gain.json",
+        {"session": session, "id": acc_id, "start": start, "end": end},
     )
-    acc = accounts_sorted[0]
-    return acc.get("id"), acc
+    if j.get("error") is False:
+        if isinstance(j.get("dailyGain"), list):
+            return j["dailyGain"]
+        if isinstance(j.get("data"), list):  # một số bản trả 'data'
+            return j["data"]
+    raise RuntimeError(f"get-daily-gain failed: {j}")
 
-def get_daily_gain_range(session, account_id, start_date: date, end_date: date):
-    # Myfxbook daily-gain endpoint INCLUSIVE range
-    data = api_call(
-        "get-daily-gain.json",
-        {
-			"session": session,
-            "id": account_id,
-            "start": ymd(start_date),
-            "end": ymd(end_date),
-        },
-    )
-    return data.get("dailyGain", []) or []
 
-def fetch_account_overview(session, account_id):
-    data = api_call("get-account.json", {"session": session, "id": account_id})
-    return data.get("account")
+def sum_simple_pct(rows: list) -> float:
+    """Cộng % đơn giản (xấp xỉ)."""
+    s = 0.0
+    for r in rows:
+        try:
+            v = float(r.get("value") if "value" in r else r.get("gain", 0.0))
+        except Exception:
+            v = 0.0
+        s += v
+    return s
 
-def send_tele(msg: str):
+
+def sum_compound_pct(rows: list) -> float:
+    """Cộng dồn theo lãi kép từ daily % (chính xác hơn)."""
+    acc = 1.0
+    for r in rows:
+        try:
+            v = float(r.get("value") if "value" in r else r.get("gain", 0.0))
+        except Exception:
+            v = 0.0
+        acc *= (1.0 + v / 100.0)
+    return (acc - 1.0) * 100.0
+
+
+def fmt_pct(x: float | None) -> str:
+    try:
+        return f"{float(x):+.2f}%"
+    except Exception:
+        return "N/A"
+
+
+def ranges_today_week_month() -> dict:
+    """Trả các khoảng ngày (YYYY-MM-DD)."""
+    today = now_vn().date()
+    start_week = today - timedelta(days=today.weekday())  # Monday
+    start_month = today.replace(day=1)
+    dd = lambda d: d.strftime("%Y-%m-%d")
+    return {
+        "day": (dd(today), dd(today)),
+        "week": (dd(start_week), dd(today)),
+        "month": (dd(start_month), dd(today)),
+    }
+
+
+def telegram_send(text: str) -> None:
     if not BOT_TOKEN or not CHAT_ID:
-        logging.info("Telegram env missing; skip send.")
+        logging.warning("Thiếu TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID – bỏ qua gửi Telegram.")
         return
-    full = f"💹 ROI REPORT\n{msg}"
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json={"chat_id": CHAT_ID, "text": full},
-            timeout=20,
-        )
+        r = requests.post(url, json={"chat_id": CHAT_ID, "text": text}, timeout=HTTP_TIMEOUT)
+        r.raise_for_status()
+        logging.info("Telegram: sent")
     except Exception as e:
-        logging.exception(f"Telegram send error: {e}")
+        logging.exception(f"Telegram error: {e}")
 
-# ---------- Main compute ----------
+
+# ============== Main ==============
 def main():
+    session = None
     try:
-        session = api_login()
-        logging.info("Myfxbook login OK")
+        session = myfx_login()
+
+        accounts = myfx_get_accounts(session)
+        acc_id, acc_meta = pick_account(accounts)
+        logging.info("Using account id=%s, name=%s, broker=%s",
+                     acc_id, acc_meta.get("name"), acc_meta.get("broker"))
+
+        # ALL (tổng) – lấy luôn trường 'gain' tổng của account nếu có
+        roi_all = None
+        try:
+            roi_all = float(acc_meta.get("gain"))
+        except Exception:
+            roi_all = None
+
+        # Day/Week/Month: lấy daily và cộng dồn (lãi kép)
+        rg = ranges_today_week_month()
+		results = {}
+
+        for key, (start, end) in rg.items():
+            try:
+                rows = myfx_daily_gain(session, acc_id, start, end)
+                roi_simple = sum_simple_pct(rows)
+                roi_comp = sum_compound_pct(rows)
+                results[key] = {"simple": roi_simple, "compound": roi_comp, "n": len(rows)}
+                logging.info("ROI %s %s→%s | days=%s | simple=%s | compound=%s",
+                             key, start, end, len(rows), fmt_pct(roi_simple), fmt_pct(roi_comp))
+            except Exception as e:
+                logging.warning("Fetch ROI %s fail: %s", key, e)
+                results[key] = None
+                time.sleep(1)
+
+        # Build message
+        lines = [f"{TITLE_PREFIX}", "📊 ROI (Myfxbook)"]
+        lines.append(f"• Account: {acc_meta.get('name','N/A')} | ID: {acc_id} | Broker: {acc_meta.get('broker','N/A')}")
+        lines.append(f"• Time: {now_vn().strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append("")
+
+        def pick(v):
+            if not v:
+                return "N/A"
+            # ưu tiên compound
+            return fmt_pct(v.get("compound"))
+
+        lines.append(f"Day:   {pick(results.get('day'))}")
+        lines.append(f"Week:  {pick(results.get('week'))}")
+        lines.append(f"Month: {pick(results.get('month'))}")
+        lines.append(f"All:   {fmt_pct(roi_all) if roi_all is not None else 'N/A'}")
+
+        msg = "\n".join(lines)
+        logging.info("Message:\n%s", msg)
+
+        telegram_send(msg)
+
     except Exception as e:
-        logging.exception("Login failed")
+        logging.exception("Fatal error: %s", e)
+        # báo lỗi về Telegram cho dễ debug
+        try:
+            telegram_send(f"{TITLE_PREFIX}\n❌ ERROR: {e}")
+        except Exception:
+            pass
         sys.exit(1)
+    finally:
+        if session:
+            myfx_logout(session)
 
-    try:
-        account_id, acc_brief = pick_account_id(session)
-    except Exception as e:
-        logging.exception("Pick account failed")
-        sys.exit(1)
-
-    logging.info(f"Use account: {acc_brief.get('name')} | id={account_id} | broker={acc_brief.get('broker')} | server={acc_brief.get('server')}")
-
-    # Date ranges
-    today = dt_today()
-    start_day = today  # today only
-    start_week = today - timedelta(days=today.weekday())  # Monday of this week
-    start_month = date(today.year, today.month, 1)
-
-    # Pull daily gains
-    try:
-        dg_day = get_daily_gain_range(session, account_id, start_day, today)
-        dg_week = get_daily_gain_range(session, account_id, start_week, today)
-        dg_month = get_daily_gain_range(session, account_id, start_month, today)
-    except Exception as e:
-        logging.exception("Daily gain fetch failed")
-        sys.exit(1)
-
-    roi_day = compound_gain_percent(dg_day)
-    roi_week = compound_gain_percent(dg_week)
-    roi_month = compound_gain_percent(dg_month)
-
-    # Overview for ALL-time gain/drawdown/equity
-    try:
-        acc_full = fetch_account_overview(session, account_id)
-    except Exception as e:
-        logging.exception("Overview fetch failed")
-        sys.exit(1)
-
-    gain_all = float(acc_full.get("gain", 0.0))  # % all-time gain
-    dd = float(acc_full.get("drawdown", 0.0)) if acc_full.get("drawdown") is not None else None
-    balance = acc_full.get("balance")
-    equity = acc_full.get("equity")
-    currency = acc_full.get("currency")
-    last_update = acc_full.get("lastUpdateDate")
-
-    # Build message
-    lines = []
-    lines.append(f"🏦 {acc_full.get('name')} (id {account_id})")
-    lines.append(f"Broker: {acc_full.get('broker')} | Server: {acc_full.get('server')}")
-    lines.append(f"Balance: {balance:.2f} {currency} | Equity: {equity:.2f} {currency}")
-    if dd is not None:
-    lines.append(f"Max DD: {dd:.2f}%")
-    lines.append("— ROI (%) —")
-	lines.append(f"Day: {roi_day:+.2f}%")
-    lines.append(f"Week: {roi_week:+.2f}%")
-    lines.append(f"Month: {roi_month:+.2f}%")
-    lines.append(f"All: {gain_all:+.2f}%")
-    lines.append(f"Updated: {last_update}")
-    msg = "\n".join(lines)
-
-    logging.info("\n" + msg)
-    send_tele(msg)
 
 if __name__ == "__main__":
     main()
