@@ -184,7 +184,7 @@ def main():
 
         # Day/Week/Month: lấy daily và cộng dồn (lãi kép)
         rg = ranges_today_week_month()
-		results = {}
+	results = {}
 
         for key, (start, end) in rg.items():
             try:
