@@ -29,7 +29,7 @@ PASSWORD = os.getenv("MYFXBOOK_PASSWORD", "")
 PREF_ACC_ID = os.getenv("MYFXBOOK_ACCOUNT_ID", "")
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-TITLE_PREFIX = os.getenv("TITLE_PREFIX", "💵 TRADE GOODS")
+TITLE_PREFIX = os.getenv("TITLE_PREFIX", "💵 ROI TRADE GOODS")
 
 # ============== CONST ==============
 API_BASE = "https://www.myfxbook.com/api"
@@ -215,10 +215,9 @@ def main() -> None:
                 time.sleep(1)
 
         # Build message
-        lines = [f"{TITLE_PREFIX}", "📊 ROI (Myfxbook)"]
+        lines = [f"{TITLE_PREFIX}", "📊 ROI (COPY TRADING)"]
         lines.append(
-            f"• Account: {acc_meta.get('name','N/A')} | ID: {acc_id} | Broker: {acc_meta.get('broker','N/A')}"
-        )
+            f"• Account: {acc_meta.get('name','N/A')} | ID: {acc_id}")
         lines.append(f"• Time: {now_vn().strftime('%Y-%m-%d %H:%M:%S')}")
         lines.append("")
 
