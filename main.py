@@ -175,10 +175,10 @@ def main():
     if dd is not None:
         lines.append(f"Max DD: {dd:.2f}%")
     lines.append("— ROI (%) —")
-	lines.append(f"Day:   {roi_day:+.2f}%")
-    lines.append(f"Week:  {roi_week:+.2f}%")
+	lines.append(f"Day: {roi_day:+.2f}%")
+    lines.append(f"Week: {roi_week:+.2f}%")
     lines.append(f"Month: {roi_month:+.2f}%")
-    lines.append(f"All:   {gain_all:+.2f}%")
+    lines.append(f"All: {gain_all:+.2f}%")
     lines.append(f"Updated: {last_update}")
     msg = "\n".join(lines)
 
