@@ -1,3 +1,3 @@
+metaapi-cloud-sdk
 pandas
-numpy
 requests
