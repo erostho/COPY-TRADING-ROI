@@ -173,7 +173,7 @@ def main():
     lines.append(f"Broker: {acc_full.get('broker')} | Server: {acc_full.get('server')}")
     lines.append(f"Balance: {balance:.2f} {currency} | Equity: {equity:.2f} {currency}")
     if dd is not None:
-        lines.append(f"Max DD: {dd:.2f}%")
+    lines.append(f"Max DD: {dd:.2f}%")
     lines.append("— ROI (%) —")
 	lines.append(f"Day: {roi_day:+.2f}%")
     lines.append(f"Week: {roi_week:+.2f}%")
